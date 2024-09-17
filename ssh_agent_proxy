@@ -45,7 +45,6 @@ class SSHAgentProxy:
                         data = struct.pack(">I", msg_len)
 
                     dest_writer.write(data + msg_data)
-                    await dest_writer.drain()
                     self.print_verbose(data + msg_data, key, direction)
             except asyncio.CancelledError:
                 pass
@@ -88,9 +87,6 @@ class SSHAgentProxy:
 
         # Place the specified identity first, followed by the other identities
         filtered_identities = [specified_identity] + other_identities if specified_identity else other_identities
-        for ide in filtered_identities:
-            print(f"{ide[3]}!r", file=sys.stderr)
-        print("---", file=sys.stderr)
 
         new_msg_data = struct.pack(">BI", MessageType.IDENTITIES_ANSWER.value, len(filtered_identities))
         for identity in filtered_identities:
@@ -136,7 +132,6 @@ class SSHAgentProxy:
 
         # Send REQUEST_IDENTITIES message
         writer.write(struct.pack(">IB", 1, MessageType.REQUEST_IDENTITIES.value))
-        await writer.drain()
 
         # Read response
         data = await reader.read(4)

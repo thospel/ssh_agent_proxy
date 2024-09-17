@@ -8,6 +8,7 @@ import hashlib
 from pathlib import Path
 from typing import List, NamedTuple
 from enum import Enum
+from functools import partial
 
 # Define SSH agent protocol message types as an enum
 class MessageType(Enum):
@@ -134,7 +135,7 @@ class SSHAgentProxy:
             fingerprint = self.get_fingerprint(identity.key)
             socket_path = self.directory / fingerprint
 
-            server = await asyncio.start_unix_server(lambda r, w, identity=identity: self.handle_client(r, w, identity), str(socket_path))
+            server = await asyncio.start_unix_server(partial(self.handle_client, identity=identity), str(socket_path))
             servers.append(server)
 
         # Start all servers concurrently

@@ -7,15 +7,17 @@ import os
 import hashlib
 from pathlib import Path
 from typing import List, Tuple
+from enum import Enum
 
-# Define SSH agent protocol message types as constants
-SSH_AGENTC_REQUEST_IDENTITIES = 11
-SSH_AGENT_IDENTITIES_ANSWER = 12
-SSH_AGENTC_SIGN_REQUEST = 13
-SSH_AGENT_SIGN_RESPONSE = 14
-SSH_AGENT_FAILURE = 5
-SSH_AGENT_SUCCESS = 6
-SSH_AGENTC_EXTENSION = 27
+# Define SSH agent protocol message types as an enum
+class MessageType(Enum):
+    REQUEST_IDENTITIES = 11
+    IDENTITIES_ANSWER = 12
+    SIGN_REQUEST = 13
+    SIGN_RESPONSE = 14
+    FAILURE = 5
+    SUCCESS = 6
+    EXTENSION = 27
 
 class SSHAgentProxy:
     def __init__(self, agent_socket_path: str, directory: Path):
@@ -26,7 +28,7 @@ class SSHAgentProxy:
         agent_reader, agent_writer = await asyncio.open_unix_connection(self.agent_socket_path)
         print("Connection made", file=sys.stderr)
 
-        async def forward_data(src_reader: asyncio.StreamReader, dest_writer: asyncio.StreamWriter) -> None:
+        async def forward_data(src_reader: asyncio.StreamReader, dest_writer: asyncio.StreamWriter, direction: str) -> None:
             try:
                 while True:
                     data = await src_reader.read(4)
@@ -37,14 +39,14 @@ class SSHAgentProxy:
                     if not msg_data:
                         break
 
-                    if msg_data[0] == SSH_AGENT_IDENTITIES_ANSWER:
+                    if msg_data[0] == MessageType.IDENTITIES_ANSWER.value:
                         msg_data = self.filter_identities(msg_data, key)
                         msg_len = len(msg_data)
                         data = struct.pack(">I", msg_len)
 
                     dest_writer.write(data + msg_data)
                     await dest_writer.drain()
-                    self.print_verbose(data + msg_data, key)
+                    self.print_verbose(data + msg_data, key, direction)
             except asyncio.CancelledError:
                 pass
             finally:
@@ -53,8 +55,8 @@ class SSHAgentProxy:
 
         try:
             await asyncio.gather(
-                forward_data(reader, agent_writer),
-                forward_data(agent_reader, writer)
+                forward_data(reader, agent_writer, "to agent"),
+                forward_data(agent_reader, writer, "from agent")
             )
         except asyncio.CancelledError:
             pass
@@ -68,20 +70,29 @@ class SSHAgentProxy:
     def filter_identities(self, msg_data: bytes, key: bytes) -> bytes:
         num_identities = struct.unpack(">I", msg_data[1:5])[0]
         offset = 5
-        filtered_identities: List[Tuple[int, bytes, int, bytes]] = []
+        specified_identity = None
+        other_identities: List[Tuple[int, bytes, int, bytes]] = []
 
         for _ in range(num_identities):
             key_len = struct.unpack(">I", msg_data[offset:offset+4])[0]
             current_key = msg_data[offset+4:offset+4+key_len]
             comment_len = struct.unpack(">I", msg_data[offset+4+key_len:offset+8+key_len])[0]
+            comment = msg_data[offset+8+key_len:offset+8+key_len+comment_len]
 
             if current_key == key:
-                comment = msg_data[offset+8+key_len:offset+8+key_len+comment_len]
-                filtered_identities.append((key_len, current_key, comment_len, comment))
+                specified_identity = (key_len, current_key, comment_len, comment)
+            else:
+                other_identities.append((key_len, current_key, comment_len, comment))
 
             offset += 8 + key_len + comment_len
 
-        new_msg_data = struct.pack(">BI", SSH_AGENT_IDENTITIES_ANSWER, len(filtered_identities))
+        # Place the specified identity first, followed by the other identities
+        filtered_identities = [specified_identity] + other_identities if specified_identity else other_identities
+        for ide in filtered_identities:
+            print(f"{ide[3]}!r", file=sys.stderr)
+        print("---", file=sys.stderr)
+
+        new_msg_data = struct.pack(">BI", MessageType.IDENTITIES_ANSWER.value, len(filtered_identities))
         for identity in filtered_identities:
             new_msg_data += struct.pack(">I%dsI%ds" % (identity[0], identity[2]), identity[0], identity[1], identity[2], identity[3])
 
@@ -92,64 +103,17 @@ class SSHAgentProxy:
         md5_fingerprint = hashlib.md5(key).hexdigest()
         return md5_fingerprint
 
-    def print_verbose(self, data: bytes, key: bytes) -> None:
+    def print_verbose(self, data: bytes, key: bytes, direction: str) -> None:
         fingerprint = self.get_fingerprint(key)
-        msg_len = struct.unpack(">I", data[:4])[0]
         msg_type = data[4]
-        msg_payload = data[5:]
-
         msg_type_str = self.get_msg_type_str(msg_type)
-        print(f"{fingerprint}: Length={msg_len}, Type={msg_type} ({msg_type_str}), Payload={msg_payload.hex()}", file=sys.stderr)
-
-        if msg_type == SSH_AGENTC_EXTENSION:
-            extension_name_len = struct.unpack(">I", msg_payload[:4])[0]
-            extension_name = msg_payload[4:4+extension_name_len].decode()
-            extension_data = msg_payload[4+extension_name_len:]
-            print(f"Extension Name: {extension_name}, Extension Data: {extension_data.hex()}", file=sys.stderr)
-        elif msg_type == SSH_AGENTC_REQUEST_IDENTITIES:
-            print("Requesting identities", file=sys.stderr)
-        elif msg_type == SSH_AGENT_IDENTITIES_ANSWER:
-            num_identities = struct.unpack(">I", msg_payload[:4])[0]
-            offset = 4
-            identities = []
-            for _ in range(num_identities):
-                key_len = struct.unpack(">I", msg_payload[offset:offset+4])[0]
-                key = msg_payload[offset+4:offset+4+key_len]
-                comment_len = struct.unpack(">I", msg_payload[offset+4+key_len:offset+8+key_len])[0]
-                comment = msg_payload[offset+8+key_len:offset+8+key_len+comment_len]
-                identities.append((key, comment))
-                offset += 8 + key_len + comment_len
-            print(f"Identities: {identities}", file=sys.stderr)
-        elif msg_type == SSH_AGENTC_SIGN_REQUEST:
-            key_len = struct.unpack(">I", msg_payload[:4])[0]
-            key = msg_payload[4:4+key_len]
-            data_len = struct.unpack(">I", msg_payload[4+key_len:8+key_len])[0]
-            data = msg_payload[8+key_len:8+key_len+data_len]
-            flags = struct.unpack(">I", msg_payload[8+key_len+data_len:12+key_len+data_len])[0]
-            print(f"Sign Request: Key={key.hex()}, Data={data.hex()}, Flags={flags}", file=sys.stderr)
-        elif msg_type == SSH_AGENT_SIGN_RESPONSE:
-            sig_len = struct.unpack(">I", msg_payload[:4])[0]
-            signature = msg_payload[4:4+sig_len]
-            print(f"Sign Response: Signature={signature.hex()}", file=sys.stderr)
-        elif msg_type == SSH_AGENT_FAILURE:
-            print("Agent Failure", file=sys.stderr)
-        elif msg_type == SSH_AGENT_SUCCESS:
-            print("Agent Success", file=sys.stderr)
-        else:
-            print(f"Payload: {msg_payload.hex()}", file=sys.stderr)
+        print(f"{fingerprint} [{direction}]: Message Type: {msg_type_str}", file=sys.stderr)
 
     def get_msg_type_str(self, msg_type: int) -> str:
-        # Define SSH agent protocol message types
-        msg_types = {
-            SSH_AGENTC_REQUEST_IDENTITIES: "SSH_AGENTC_REQUEST_IDENTITIES",
-            SSH_AGENT_IDENTITIES_ANSWER: "SSH_AGENT_IDENTITIES_ANSWER",
-            SSH_AGENTC_SIGN_REQUEST: "SSH_AGENTC_SIGN_REQUEST",
-            SSH_AGENT_SIGN_RESPONSE: "SSH_AGENT_SIGN_RESPONSE",
-            SSH_AGENT_FAILURE: "SSH_AGENT_FAILURE",
-            SSH_AGENT_SUCCESS: "SSH_AGENT_SUCCESS",
-            SSH_AGENTC_EXTENSION: "SSH_AGENTC_EXTENSION"
-        }
-        return msg_types.get(msg_type, "UNKNOWN")
+        try:
+            return MessageType(msg_type).name
+        except ValueError:
+            return "UNKNOWN"
 
     async def start_proxy(self) -> None:
         identities = await self.get_identities()
@@ -170,8 +134,8 @@ class SSHAgentProxy:
     async def get_identities(self) -> List[Tuple[int, bytes, int, bytes]]:
         reader, writer = await asyncio.open_unix_connection(self.agent_socket_path)
 
-        # Send SSH_AGENTC_REQUEST_IDENTITIES message
-        writer.write(struct.pack(">IB", 1, SSH_AGENTC_REQUEST_IDENTITIES))
+        # Send REQUEST_IDENTITIES message
+        writer.write(struct.pack(">IB", 1, MessageType.REQUEST_IDENTITIES.value))
         await writer.drain()
 
         # Read response

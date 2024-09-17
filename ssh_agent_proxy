@@ -6,7 +6,7 @@ import struct
 import os
 import hashlib
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, NamedTuple
 from enum import Enum
 
 # Define SSH agent protocol message types as an enum
@@ -19,12 +19,19 @@ class MessageType(Enum):
     SUCCESS = 6
     EXTENSION = 27
 
+# Define a NamedTuple for identities
+class Identity(NamedTuple):
+    key_len: int
+    key: bytes
+    comment_len: int
+    comment: bytes
+
 class SSHAgentProxy:
     def __init__(self, agent_socket_path: str, directory: Path):
         self.agent_socket_path = agent_socket_path
         self.directory = directory
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, key: bytes) -> None:
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, identity: Identity) -> None:
         agent_reader, agent_writer = await asyncio.open_unix_connection(self.agent_socket_path)
         print("Connection made", file=sys.stderr)
 
@@ -40,12 +47,12 @@ class SSHAgentProxy:
                         break
 
                     if msg_data[0] == MessageType.IDENTITIES_ANSWER.value:
-                        msg_data = self.filter_identities(msg_data, key)
+                        msg_data = self.filter_identities(msg_data, identity.key)
                         msg_len = len(msg_data)
                         data = struct.pack(">I", msg_len)
 
                     dest_writer.write(data + msg_data)
-                    self.print_verbose(data + msg_data, key, direction)
+                    self.print_verbose(data + msg_data, identity.key, direction)
             except asyncio.CancelledError:
                 pass
             finally:
@@ -66,31 +73,38 @@ class SSHAgentProxy:
             await agent_writer.wait_closed()
             print("Connection lost", file=sys.stderr)
 
-    def filter_identities(self, msg_data: bytes, key: bytes) -> bytes:
+    def parse_identities(self, msg_data: bytes) -> List[Identity]:
         num_identities = struct.unpack(">I", msg_data[1:5])[0]
         offset = 5
-        specified_identity = None
-        other_identities: List[Tuple[int, bytes, int, bytes]] = []
+        identities: List[Identity] = []
 
         for _ in range(num_identities):
             key_len = struct.unpack(">I", msg_data[offset:offset+4])[0]
-            current_key = msg_data[offset+4:offset+4+key_len]
+            key = msg_data[offset+4:offset+4+key_len]
             comment_len = struct.unpack(">I", msg_data[offset+4+key_len:offset+8+key_len])[0]
             comment = msg_data[offset+8+key_len:offset+8+key_len+comment_len]
-
-            if current_key == key:
-                specified_identity = (key_len, current_key, comment_len, comment)
-            else:
-                other_identities.append((key_len, current_key, comment_len, comment))
-
+            identities.append(Identity(key_len, key, comment_len, comment))
             offset += 8 + key_len + comment_len
+
+        return identities
+
+    def filter_identities(self, msg_data: bytes, key: bytes) -> bytes:
+        identities = self.parse_identities(msg_data)
+        specified_identity = None
+        other_identities = []
+
+        for identity in identities:
+            if identity.key == key:
+                specified_identity = identity
+            else:
+                other_identities.append(identity)
 
         # Place the specified identity first, followed by the other identities
         filtered_identities = [specified_identity] + other_identities if specified_identity else other_identities
 
         new_msg_data = struct.pack(">BI", MessageType.IDENTITIES_ANSWER.value, len(filtered_identities))
         for identity in filtered_identities:
-            new_msg_data += struct.pack(">I%dsI%ds" % (identity[0], identity[2]), identity[0], identity[1], identity[2], identity[3])
+            new_msg_data += struct.pack(">I%dsI%ds" % (identity.key_len, identity.comment_len), identity.key_len, identity.key, identity.comment_len, identity.comment)
 
         return new_msg_data
 
@@ -117,17 +131,16 @@ class SSHAgentProxy:
         servers = []
 
         for identity in identities:
-            key = identity[1]
-            fingerprint = self.get_fingerprint(key)
+            fingerprint = self.get_fingerprint(identity.key)
             socket_path = self.directory / fingerprint
 
-            server = await asyncio.start_unix_server(lambda r, w, key=key: self.handle_client(r, w, key), str(socket_path))
+            server = await asyncio.start_unix_server(lambda r, w, identity=identity: self.handle_client(r, w, identity), str(socket_path))
             servers.append(server)
 
         # Start all servers concurrently
         await asyncio.gather(*(server.serve_forever() for server in servers))
 
-    async def get_identities(self) -> List[Tuple[int, bytes, int, bytes]]:
+    async def get_identities(self) -> List[Identity]:
         reader, writer = await asyncio.open_unix_connection(self.agent_socket_path)
 
         # Send REQUEST_IDENTITIES message
@@ -141,21 +154,7 @@ class SSHAgentProxy:
         msg_len = struct.unpack(">I", data)[0]
         msg_data = await reader.read(msg_len)
 
-        num_identities = struct.unpack(">I", msg_data[1:5])[0]
-        offset = 5
-        identities: List[Tuple[int, bytes, int, bytes]] = []
-
-        for _ in range(num_identities):
-            key_len = struct.unpack(">I", msg_data[offset:offset+4])[0]
-            key = msg_data[offset+4:offset+4+key_len]
-            comment_len = struct.unpack(">I", msg_data[offset+4+key_len:offset+8+key_len])[0]
-            comment = msg_data[offset+8+key_len:offset+8+key_len+comment_len]
-
-            identities.append((key_len, key, comment_len, comment))
-
-            offset += 8 + key_len + comment_len
-            if offset >= len(msg_data):
-                break
+        identities = self.parse_identities(msg_data)
 
         writer.close()
         await writer.wait_closed()

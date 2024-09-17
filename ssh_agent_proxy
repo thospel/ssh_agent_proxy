@@ -12,13 +12,20 @@ from functools import partial
 
 # Define SSH agent protocol message types as an enum
 class MessageType(Enum):
-    REQUEST_IDENTITIES = 11
-    IDENTITIES_ANSWER = 12
-    SIGN_REQUEST = 13
-    SIGN_RESPONSE = 14
-    FAILURE = 5
-    SUCCESS = 6
-    EXTENSION = 27
+    FAILURE		=  5
+    SUCCESS		=  6
+    REQUEST_IDENTITIES	= 11
+    IDENTITIES_ANSWER	= 12
+    SIGN_REQUEST	= 13
+    SIGN_RESPONSE	= 14
+    EXTENSION		= 27
+
+    @classmethod
+    def get_name(cls, msg_type: int) -> str:
+        try:
+            return cls(msg_type).name
+        except ValueError:
+            return "UNKNOWN"
 
 # Define a NamedTuple for identities
 class Identity(NamedTuple):
@@ -117,14 +124,8 @@ class SSHAgentProxy:
     def print_verbose(self, data: bytes, key: bytes, direction: str) -> None:
         fingerprint = self.get_fingerprint(key)
         msg_type = data[4]
-        msg_type_str = self.get_msg_type_str(msg_type)
+        msg_type_str = MessageType.get_name(msg_type)
         print(f"{fingerprint} [{direction}]: Message Type: {msg_type_str}", file=sys.stderr)
-
-    def get_msg_type_str(self, msg_type: int) -> str:
-        try:
-            return MessageType(msg_type).name
-        except ValueError:
-            return "UNKNOWN"
 
     async def start_proxy(self) -> None:
         identities = await self.get_identities()
@@ -162,7 +163,7 @@ class SSHAgentProxy:
 
         return identities
 
-if __name__ == "__main__":
+async def main():
     agent_socket_path = os.getenv("SSH_AUTH_SOCK")
     if not agent_socket_path:
         print("Error: SSH_AUTH_SOCK environment variable is not set.", file=sys.stderr)
@@ -173,4 +174,8 @@ if __name__ == "__main__":
     directory.mkdir(exist_ok=True)
 
     proxy = SSHAgentProxy(agent_socket_path, directory)
-    asyncio.run(proxy.start_proxy())
+
+    await proxy.start_proxy()
+
+if __name__ == "__main__":
+    asyncio.run(main())

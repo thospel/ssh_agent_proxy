@@ -12,13 +12,13 @@ from functools import partial
 
 # Define SSH agent protocol message types as an enum
 class MessageType(Enum):
-    FAILURE		=  5
-    SUCCESS		=  6
-    REQUEST_IDENTITIES	= 11
-    IDENTITIES_ANSWER	= 12
-    SIGN_REQUEST	= 13
-    SIGN_RESPONSE	= 14
-    EXTENSION		= 27
+    FAILURE = 5
+    SUCCESS = 6
+    REQUEST_IDENTITIES = 11
+    IDENTITIES_ANSWER = 12
+    SIGN_REQUEST = 13
+    SIGN_RESPONSE = 14
+    EXTENSION = 27
 
     @classmethod
     def get_name(cls, msg_type: int) -> str:
@@ -33,6 +33,11 @@ class Identity(NamedTuple):
     key: bytes
     comment_len: int
     comment: bytes
+
+    def get_fingerprint(self) -> str:
+        # Calculate the MD5 fingerprint over the correct data
+        md5_fingerprint = hashlib.md5(self.key).hexdigest()
+        return md5_fingerprint
 
 class SSHAgentProxy:
     def __init__(self, agent_socket_path: str, directory: Path):
@@ -60,7 +65,7 @@ class SSHAgentProxy:
                         data = struct.pack(">I", msg_len)
 
                     dest_writer.write(data + msg_data)
-                    self.print_verbose(data + msg_data, identity.key, direction)
+                    self.print_verbose(data + msg_data, identity, direction)
             except asyncio.CancelledError:
                 pass
             finally:
@@ -116,13 +121,8 @@ class SSHAgentProxy:
 
         return new_msg_data
 
-    def get_fingerprint(self, key: bytes) -> str:
-        # Calculate the MD5 fingerprint over the correct data
-        md5_fingerprint = hashlib.md5(key).hexdigest()
-        return md5_fingerprint
-
-    def print_verbose(self, data: bytes, key: bytes, direction: str) -> None:
-        fingerprint = self.get_fingerprint(key)
+    def print_verbose(self, data: bytes, identity: Identity, direction: str) -> None:
+        fingerprint = identity.get_fingerprint()
         msg_type = data[4]
         msg_type_str = MessageType.get_name(msg_type)
         print(f"{fingerprint} [{direction}]: Message Type: {msg_type_str}", file=sys.stderr)
@@ -133,7 +133,7 @@ class SSHAgentProxy:
         servers = []
 
         for identity in identities:
-            fingerprint = self.get_fingerprint(identity.key)
+            fingerprint = identity.get_fingerprint()
             socket_path = self.directory / fingerprint
 
             server = await asyncio.start_unix_server(partial(self.handle_client, identity=identity), str(socket_path))

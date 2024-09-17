@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+
+import asyncio
+import sys
+import struct
+import os
+import hashlib
+from pathlib import Path
+from typing import List, Tuple
+
+# Define SSH agent protocol message types as constants
+SSH_AGENTC_REQUEST_IDENTITIES = 11
+SSH_AGENT_IDENTITIES_ANSWER = 12
+SSH_AGENTC_SIGN_REQUEST = 13
+SSH_AGENT_SIGN_RESPONSE = 14
+SSH_AGENT_FAILURE = 5
+SSH_AGENT_SUCCESS = 6
+SSH_AGENTC_EXTENSION = 27
+
+class SSHAgentProxy:
+    def __init__(self, agent_socket_path: str, directory: Path):
+        self.agent_socket_path = agent_socket_path
+        self.directory = directory
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, key: bytes) -> None:
+        agent_reader, agent_writer = await asyncio.open_unix_connection(self.agent_socket_path)
+        print("Connection made", file=sys.stderr)
+
+        async def forward_data(src_reader: asyncio.StreamReader, dest_writer: asyncio.StreamWriter) -> None:
+            try:
+                while True:
+                    data = await src_reader.read(4)
+                    if not data:
+                        break
+                    msg_len = struct.unpack(">I", data)[0]
+                    msg_data = await src_reader.read(msg_len)
+                    if not msg_data:
+                        break
+
+                    if msg_data[0] == SSH_AGENT_IDENTITIES_ANSWER:
+                        msg_data = self.filter_identities(msg_data, key)
+                        msg_len = len(msg_data)
+                        data = struct.pack(">I", msg_len)
+
+                    dest_writer.write(data + msg_data)
+                    await dest_writer.drain()
+                    self.print_verbose(data + msg_data, key)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                dest_writer.close()
+                await dest_writer.wait_closed()
+
+        try:
+            await asyncio.gather(
+                forward_data(reader, agent_writer),
+                forward_data(agent_reader, writer)
+            )
+        except asyncio.CancelledError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            agent_writer.close()
+            await agent_writer.wait_closed()
+            print("Connection lost", file=sys.stderr)
+
+    def filter_identities(self, msg_data: bytes, key: bytes) -> bytes:
+        num_identities = struct.unpack(">I", msg_data[1:5])[0]
+        offset = 5
+        filtered_identities: List[Tuple[int, bytes, int, bytes]] = []
+
+        for _ in range(num_identities):
+            key_len = struct.unpack(">I", msg_data[offset:offset+4])[0]
+            current_key = msg_data[offset+4:offset+4+key_len]
+            comment_len = struct.unpack(">I", msg_data[offset+4+key_len:offset+8+key_len])[0]
+
+            if current_key == key:
+                comment = msg_data[offset+8+key_len:offset+8+key_len+comment_len]
+                filtered_identities.append((key_len, current_key, comment_len, comment))
+
+            offset += 8 + key_len + comment_len
+
+        new_msg_data = struct.pack(">BI", SSH_AGENT_IDENTITIES_ANSWER, len(filtered_identities))
+        for identity in filtered_identities:
+            new_msg_data += struct.pack(">I%dsI%ds" % (identity[0], identity[2]), identity[0], identity[1], identity[2], identity[3])
+
+        return new_msg_data
+
+    def get_fingerprint(self, key: bytes) -> str:
+        # Calculate the MD5 fingerprint over the correct data
+        md5_fingerprint = hashlib.md5(key).hexdigest()
+        return md5_fingerprint
+
+    def print_verbose(self, data: bytes, key: bytes) -> None:
+        fingerprint = self.get_fingerprint(key)
+        msg_len = struct.unpack(">I", data[:4])[0]
+        msg_type = data[4]
+        msg_payload = data[5:]
+
+        msg_type_str = self.get_msg_type_str(msg_type)
+        print(f"{fingerprint}: Length={msg_len}, Type={msg_type} ({msg_type_str}), Payload={msg_payload.hex()}", file=sys.stderr)
+
+        if msg_type == SSH_AGENTC_EXTENSION:
+            extension_name_len = struct.unpack(">I", msg_payload[:4])[0]
+            extension_name = msg_payload[4:4+extension_name_len].decode()
+            extension_data = msg_payload[4+extension_name_len:]
+            print(f"Extension Name: {extension_name}, Extension Data: {extension_data.hex()}", file=sys.stderr)
+        elif msg_type == SSH_AGENTC_REQUEST_IDENTITIES:
+            print("Requesting identities", file=sys.stderr)
+        elif msg_type == SSH_AGENT_IDENTITIES_ANSWER:
+            num_identities = struct.unpack(">I", msg_payload[:4])[0]
+            offset = 4
+            identities = []
+            for _ in range(num_identities):
+                key_len = struct.unpack(">I", msg_payload[offset:offset+4])[0]
+                key = msg_payload[offset+4:offset+4+key_len]
+                comment_len = struct.unpack(">I", msg_payload[offset+4+key_len:offset+8+key_len])[0]
+                comment = msg_payload[offset+8+key_len:offset+8+key_len+comment_len]
+                identities.append((key, comment))
+                offset += 8 + key_len + comment_len
+            print(f"Identities: {identities}", file=sys.stderr)
+        elif msg_type == SSH_AGENTC_SIGN_REQUEST:
+            key_len = struct.unpack(">I", msg_payload[:4])[0]
+            key = msg_payload[4:4+key_len]
+            data_len = struct.unpack(">I", msg_payload[4+key_len:8+key_len])[0]
+            data = msg_payload[8+key_len:8+key_len+data_len]
+            flags = struct.unpack(">I", msg_payload[8+key_len+data_len:12+key_len+data_len])[0]
+            print(f"Sign Request: Key={key.hex()}, Data={data.hex()}, Flags={flags}", file=sys.stderr)
+        elif msg_type == SSH_AGENT_SIGN_RESPONSE:
+            sig_len = struct.unpack(">I", msg_payload[:4])[0]
+            signature = msg_payload[4:4+sig_len]
+            print(f"Sign Response: Signature={signature.hex()}", file=sys.stderr)
+        elif msg_type == SSH_AGENT_FAILURE:
+            print("Agent Failure", file=sys.stderr)
+        elif msg_type == SSH_AGENT_SUCCESS:
+            print("Agent Success", file=sys.stderr)
+        else:
+            print(f"Payload: {msg_payload.hex()}", file=sys.stderr)
+
+    def get_msg_type_str(self, msg_type: int) -> str:
+        # Define SSH agent protocol message types
+        msg_types = {
+            SSH_AGENTC_REQUEST_IDENTITIES: "SSH_AGENTC_REQUEST_IDENTITIES",
+            SSH_AGENT_IDENTITIES_ANSWER: "SSH_AGENT_IDENTITIES_ANSWER",
+            SSH_AGENTC_SIGN_REQUEST: "SSH_AGENTC_SIGN_REQUEST",
+            SSH_AGENT_SIGN_RESPONSE: "SSH_AGENT_SIGN_RESPONSE",
+            SSH_AGENT_FAILURE: "SSH_AGENT_FAILURE",
+            SSH_AGENT_SUCCESS: "SSH_AGENT_SUCCESS",
+            SSH_AGENTC_EXTENSION: "SSH_AGENTC_EXTENSION"
+        }
+        return msg_types.get(msg_type, "UNKNOWN")
+
+    async def start_proxy(self) -> None:
+        identities = await self.get_identities()
+
+        servers = []
+
+        for identity in identities:
+            key = identity[1]
+            fingerprint = self.get_fingerprint(key)
+            socket_path = self.directory / fingerprint
+
+            server = await asyncio.start_unix_server(lambda r, w, key=key: self.handle_client(r, w, key), str(socket_path))
+            servers.append(server)
+
+        # Start all servers concurrently
+        await asyncio.gather(*(server.serve_forever() for server in servers))
+
+    async def get_identities(self) -> List[Tuple[int, bytes, int, bytes]]:
+        reader, writer = await asyncio.open_unix_connection(self.agent_socket_path)
+
+        # Send SSH_AGENTC_REQUEST_IDENTITIES message
+        writer.write(struct.pack(">IB", 1, SSH_AGENTC_REQUEST_IDENTITIES))
+        await writer.drain()
+
+        # Read response
+        data = await reader.read(4)
+        if not data:
+            return []
+
+        msg_len = struct.unpack(">I", data)[0]
+        msg_data = await reader.read(msg_len)
+
+        num_identities = struct.unpack(">I", msg_data[1:5])[0]
+        offset = 5
+        identities: List[Tuple[int, bytes, int, bytes]] = []
+
+        for _ in range(num_identities):
+            key_len = struct.unpack(">I", msg_data[offset:offset+4])[0]
+            key = msg_data[offset+4:offset+4+key_len]
+            comment_len = struct.unpack(">I", msg_data[offset+4+key_len:offset+8+key_len])[0]
+            comment = msg_data[offset+8+key_len:offset+8+key_len+comment_len]
+
+            identities.append((key_len, key, comment_len, comment))
+
+            offset += 8 + key_len + comment_len
+            if offset >= len(msg_data):
+                break
+
+        writer.close()
+        await writer.wait_closed()
+
+        return identities
+
+if __name__ == "__main__":
+    agent_socket_path = os.getenv("SSH_AUTH_SOCK")
+    if not agent_socket_path:
+        print("Error: SSH_AUTH_SOCK environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    home_directory = Path.home()
+    directory = home_directory / ".ssh" / "ssh_agent_proxy"
+    directory.mkdir(exist_ok=True)
+
+    proxy = SSHAgentProxy(agent_socket_path, directory)
+    asyncio.run(proxy.start_proxy())

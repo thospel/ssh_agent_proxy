@@ -10,6 +10,8 @@ from typing import List, NamedTuple
 from enum import Enum
 from functools import partial
 
+DEBUG = True
+
 # Define SSH agent protocol message types as an enum
 class MessageType(Enum):
     FAILURE = 5
@@ -46,7 +48,10 @@ class SSHAgentProxy:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, identity: Identity) -> None:
         agent_reader, agent_writer = await asyncio.open_unix_connection(self.agent_socket_path)
-        print("Connection made", file=sys.stderr)
+        # identifier = identity.get_fingerprint()
+        identifier = identity.comment.decode()
+        if DEBUG:
+            print(f"{identifier}: Accepted connection", file=sys.stderr)
 
         async def forward_data(src_reader: asyncio.StreamReader, dest_writer: asyncio.StreamWriter, direction: str) -> None:
             try:
@@ -65,7 +70,8 @@ class SSHAgentProxy:
                         data = struct.pack(">I", msg_len)
 
                     dest_writer.write(data + msg_data)
-                    self.print_verbose(data + msg_data, identity, direction)
+                    if DEBUG:
+                        self.print_verbose(data + msg_data, identifier, direction)
             except asyncio.CancelledError:
                 pass
             finally:
@@ -81,10 +87,11 @@ class SSHAgentProxy:
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
             agent_writer.close()
+            await writer.wait_closed()
             await agent_writer.wait_closed()
-            print("Connection lost", file=sys.stderr)
+            if DEBUG:
+                print(f"{identifier}: Connection closed", file=sys.stderr)
 
     def parse_identities(self, msg_data: bytes) -> List[Identity]:
         num_identities = struct.unpack(">I", msg_data[1:5])[0]
@@ -121,11 +128,10 @@ class SSHAgentProxy:
 
         return new_msg_data
 
-    def print_verbose(self, data: bytes, identity: Identity, direction: str) -> None:
-        fingerprint = identity.get_fingerprint()
+    def print_verbose(self, data: bytes, identifier: str, direction: str) -> None:
         msg_type = data[4]
         msg_type_str = MessageType.get_name(msg_type)
-        print(f"{fingerprint} [{direction}]: Message Type: {msg_type_str}", file=sys.stderr)
+        print(f"{identifier} [{direction}]: Message Type: {msg_type_str}", file=sys.stderr)
 
     async def start_proxy(self) -> None:
         identities = await self.get_identities()
@@ -140,7 +146,10 @@ class SSHAgentProxy:
             servers.append(server)
 
         # Start all servers concurrently
+        #try:
         await asyncio.gather(*(server.serve_forever() for server in servers))
+        #except asyncio.exceptions.CancelledError as exc:
+        #    pass
 
     async def get_identities(self) -> List[Identity]:
         reader, writer = await asyncio.open_unix_connection(self.agent_socket_path)

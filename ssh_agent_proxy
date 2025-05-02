@@ -56,13 +56,9 @@ class SSHAgentProxy:
         async def forward_data(src_reader: asyncio.StreamReader, dest_writer: asyncio.StreamWriter, direction: str) -> None:
             try:
                 while True:
-                    data = await src_reader.read(4)
-                    if not data:
-                        break
+                    data = await src_reader.readexactly(4)
                     msg_len = struct.unpack(">I", data)[0]
-                    msg_data = await src_reader.read(msg_len)
-                    if not msg_data:
-                        break
+                    msg_data = await src_reader.readexactly(msg_len)
 
                     if msg_data[0] == MessageType.IDENTITIES_ANSWER.value:
                         msg_data = self.filter_identities(msg_data, identity.key)
@@ -72,7 +68,7 @@ class SSHAgentProxy:
                     dest_writer.write(data + msg_data)
                     if DEBUG:
                         self.print_verbose(data + msg_data, identifier, direction)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError, IncompleteReadError:
                 pass
             finally:
                 dest_writer.close()
@@ -114,10 +110,12 @@ class SSHAgentProxy:
         other_identities = []
 
         for identity in identities:
+            print(f"{identity.key == key}", file=sys.stderr)
             if identity.key == key:
                 specified_identity = identity
             else:
                 other_identities.append(identity)
+        print("----", file=sys.stderr)
 
         # Place the specified identity first, followed by the other identities
         filtered_identities = [specified_identity] + other_identities if specified_identity else other_identities
@@ -158,12 +156,12 @@ class SSHAgentProxy:
         writer.write(struct.pack(">IB", 1, MessageType.REQUEST_IDENTITIES.value))
 
         # Read response
-        data = await reader.read(4)
-        if not data:
-            return []
+        data = await reader.readexactly(4)
+        # if not data:
+        #     return []
 
         msg_len = struct.unpack(">I", data)[0]
-        msg_data = await reader.read(msg_len)
+        msg_data = await reader.readexactly(msg_len)
 
         identities = self.parse_identities(msg_data)
 
